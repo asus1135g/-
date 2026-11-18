@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f0f17">
+<link rel="manifest" href="manifest.webmanifest">
+<title>ШИФРАТОР</title>
+<style>
+  :root {
+    --bg:#0f0f17; --panel:#1a1b26; --field:#24253a; --btn:#2a2c40; --hover:#353853;
+    --text:#e4e6f0; --muted:#7a7f99; --accent:#7aa2f7; --ok:#9ece6a; --err:#f7768e;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: "Segoe UI", system-ui, sans-serif;
+    padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
+  }
+  .wrap { max-width: 640px; margin: 0 auto; padding: 16px; }
+  h1 { color: var(--accent); font-size: 22px; margin: 8px 0 12px; }
+  .panel { background: var(--panel); border-radius: 12px; padding: 14px; }
+  label { display: block; color: var(--muted); font-size: 13px; margin: 12px 0 4px; }
+  input, textarea {
+    width: 100%; background: var(--field); color: var(--text);
+    border: 1px solid transparent; border-radius: 8px; padding: 10px;
+    font-size: 15px; font-family: inherit;
+  }
+  textarea { font-family: Consolas, monospace; font-size: 13px; min-height: 90px; resize: vertical; }
+  input:focus, textarea:focus { outline: none; border-color: var(--accent); }
+  .row { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  button {
+    background: var(--btn); color: var(--text); border: 0; border-radius: 8px;
+    padding: 9px 12px; font-size: 14px; cursor: pointer;
+  }
+  button:hover { background: var(--hover); }
+  button.primary { background: var(--accent); color: var(--bg); }
+  .hist {
+    list-style: none; padding: 0; margin: 6px 0 0; max-height: 260px; overflow: auto;
+    background: var(--field); border-radius: 8px;
+  }
+  .hist li {
+    padding: 8px 10px; border-bottom: 1px solid var(--btn); cursor: pointer;
+    font-size: 13px; font-family: Consolas, monospace; word-break: break-word;
+  }
+  .hist li:hover { background: var(--hover); }
+  .hist li.sel { background: var(--accent); color: var(--bg); }
+  #status { margin-top: 12px; min-height: 20px; font-size: 13px; color: var(--muted); }
+  .ok { color: var(--ok) !important; }
+  .err { color: var(--err) !important; }
+  .muted { color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>ШИФРАТОР</h1>
+
+  <div class="panel">
+    <label for="pw">Пароль (необов'язково, порожньо = без пароля)</label>
+    <input id="pw" type="password" autocomplete="off">
+
+    <label for="input">Вихідний текст або шифр</label>
+    <textarea id="input"></textarea>
+    <div class="row">
+      <button class="primary" id="btnEnc">Зашифрувати</button>
+      <button id="btnDec">Розшифрувати</button>
+      <button id="btnPaste">Вставити</button>
+      <button id="btnClear">Очистити</button>
+      <button id="btnPromo">Промокод</button>
+    </div>
+
+    <label for="output">Результат</label>
+    <textarea id="output" readonly></textarea>
+    <div class="row">
+      <button id="btnCopy">Копіювати результат</button>
+    </div>
+
+    <label for="search">Історія (клік — вибрати, подвійний клік — розшифрувати і скопіювати)</label>
+    <input id="search" placeholder="Пошук">
+    <ul class="hist" id="hist"></ul>
+    <div class="row">
+      <button class="primary" id="btnHistClip">У буфер (розшифр.)</button>
+      <button id="btnHistShow">Показати</button>
+      <button id="btnHistCipher">Шифр у буфер</button>
+      <button id="btnHistDel">Видалити</button>
+      <button id="btnHistClear">Очистити історію</button>
+    </div>
+
+    <div id="status"></div>
+  </div>
+
+  <p class="muted">Записи зберігаються в браузері цього пристрою. Без пароля захист слабкий.</p>
+</div>
+
+<script>
+// ---------- Налаштування ----------
+const FREE_DAILY = 5;
+const PROMO_LIMITS = { "GTA6": 10 };   // промокод видно в коді, для реального захисту потрібен сервер
+const PREVIEW_LEN = 50;
+const PBKDF2_ITERATIONS = 600000;
+
+const KEY_STORE = "shifrator_key";
+const VAULT_STORE = "shifrator_vault";
+const PROMO_STORE = "shifrator_promo";
+
+// ---------- Утиліти ----------
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+const $ = id => document.getElementById(id);
+
+function toB64(bytes) {
+  let s = "";
+  const CHUNK = 0x8000; // ділимо, щоб не переповнити стек на довгих текстах
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    s += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(s);
+}
+
+function fromB64(str) {
+  return Uint8Array.from(atob(str), c => c.charCodeAt(0));
+}
+
+function concatBytes(...arrays) {
+  const total = arrays.reduce((n, a) => n + a.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const a of arrays) { out.set(a, offset); offset += a.length; }
+  return out;
+}
+
+function randomBytes(n) {
+  return crypto.getRandomValues(new Uint8Array(n));
+}
+
+function nowStr() {
+  return new Date().toLocaleString("uk-UA");
+}
+
+function todayStr() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function say(msg, kind) {
+  const s = $("status");
+  s.textContent = msg;
+  s.className = kind === "ok" ? "ok" : kind === "err" ? "err" : "";
+}
+
+// ---------- Шифрування (AES-256-GCM) ----------
+// P — з паролем: salt(16) + iv(12) + ciphertext, ключ з пароля через PBKDF2
+// L — без пароля: iv(12) + ciphertext, ключ зберігається в браузері
+async function deriveKeyFromPassword(password, salt) {
+  const base = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt, iterations: PBKDF2_ITERATIONS, hash: "SHA-256" },
+    base,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+async function getLocalKey() {
+  let raw = localStorage.getItem(KEY_STORE);
+  if (!raw) {
+    raw = toB64(randomBytes(32));
+    localStorage.setItem(KEY_STORE, raw);
+  }
+  return crypto.subtle.importKey("raw", fromB64(raw), "AES-GCM", false, ["encrypt", "decrypt"]);
+}
+
+async function encryptText(text, password) {
+  const iv = randomBytes(12);
+  const data = enc.encode(text);
+  let key, prefix, head;
+
+  if (password) {
+    const salt = randomBytes(16);
+    key = await deriveKeyFromPassword(password, salt);
+    prefix = "P";
+    head = concatBytes(salt, iv);
+  } else {
+    key = await getLocalKey();
+    prefix = "L";
+    head = iv;
+  }
+
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, data));
+  return prefix + toB64(concatBytes(head, ct));
+}
+
+async function decryptText(cipher, password) {
+  cipher = cipher.trim();
+  const kind = cipher[0];
+  const raw = fromB64(cipher.slice(1));
+
+  if (kind === "P") {
+    if (!password) throw new Error("NEED_PASSWORD");
+    const salt = raw.slice(0, 16);
+    const iv = raw.slice(16, 28);
+    const ct = raw.slice(28);
+    const key = await deriveKeyFromPassword(password, salt);
+    return dec.decode(await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct));
+  }
+
+  if (kind === "L") {
+    const iv = raw.slice(0, 12);
+    const ct = raw.slice(12);
+    const key = await getLocalKey();
+    return dec.decode(await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct));
+  }
+
+  throw new Error("BAD_FORMAT");
+}
+
+function errorText(e) {
+  if (e.message === "NEED_PASSWORD") return "Для цього запису потрібен пароль.";
+  if (e.message === "BAD_FORMAT") return "Невірний формат шифру.";
+  if (e.name === "OperationError") return "Невірний пароль або шифр пошкоджено.";
+  return "Помилка: " + e.message;
+}
+
+// ---------- Сховище ----------
+function loadVault() {
+  try { return JSON.parse(localStorage.getItem(VAULT_STORE)) || []; }
+  catch { return []; }
+}
+
+function saveVault() {
+  localStorage.setItem(VAULT_STORE, JSON.stringify(vault));
+}
+
+let vault = loadVault();
+let visible = [];   // реальні індекси записів для видимих рядків списку
+let selected = -1;  // позиція вибраного рядка у видимому списку
+
+// ---------- Промокоди і ліміти ----------
+function loadPromo() {
+  try { return JSON.parse(localStorage.getItem(PROMO_STORE)) || {}; }
+  catch { return {}; }
+}
+
+function promoState() {
+  const s = loadPromo();
+  if (s.day !== todayStr()) { s.day = todayStr(); s.used = 0; }
+  return s;
+}
+
+function savePromo(s) {
+  localStorage.setItem(PROMO_STORE, JSON.stringify(s));
+}
+
+function dailyLimit() {
+  return PROMO_LIMITS[promoState().code] || FREE_DAILY;
+}
+
+function remaining() {
+  return Math.max(0, dailyLimit() - (promoState().used || 0));
+}
+
+function registerEncrypt() {
+  const s = promoState();
+  s.used = (s.used || 0) + 1;
+  savePromo(s);
+}
+
+function activatePromo(code) {
+  const key = code.trim().toUpperCase();
+  if (!(key in PROMO_LIMITS)) return false;
+  const s = promoState();
+  s.code = key;
+  savePromo(s);
+  return true;
+}
+
+// ---------- Буфер обміну ----------
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    // Запасний варіант для браузерів, які блокують Clipboard API
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    return ok;
+  }
+}
+
+// ---------- Історія ----------
+const previewCache = new Map();
+
+async function previewFor(item) {
+  if (item.cipher[0] !== "L") return { tag: "пароль", text: "захищено паролем" };
+  if (!previewCache.has(item.cipher)) {
+    try {
+      const plain = (await decryptText(item.cipher, "")).replace(/\s+/g, " ").trim();
+      previewCache.set(item.cipher, plain.slice(0, PREVIEW_LEN) + (plain.length > PREVIEW_LEN ? "…" : ""));
+    } catch {
+      previewCache.set(item.cipher, "не вдалося прочитати");
+    }
+  }
+  return { tag: "без пароля", text: previewCache.get(item.cipher) };
+}
+
+async function refreshList() {
+  const q = $("search").value.trim().toLowerCase();
+  const ul = $("hist");
+  ul.innerHTML = "";
+  visible = [];
+  selected = -1;
+
+  for (let i = vault.length - 1; i >= 0; i--) {
+    const item = vault[i];
+    const p = await previewFor(item);
+    const line = `${item.time}  [${p.tag}]  ${p.text}`;
+    if (q && !line.toLowerCase().includes(q)) continue;
+
+    const li = document.createElement("li");
+    li.textContent = line;
+    const pos = visible.length;
+    li.onclick = () => selectRow(pos);
+    li.ondblclick = () => histClip();
+    ul.appendChild(li);
+    visible.push(i);
+  }
+}
+
+function selectRow(pos) {
+  selected = pos;
+  [...$("hist").children].forEach((li, i) => li.classList.toggle("sel", i === pos));
+}
+
+function selectedIndex() {
+  if (selected < 0 || selected >= visible.length) {
+    say("Оберіть запис в історії.", "err");
+    return null;
+  }
+  return visible[selected];
+}
+
+// ---------- Дії ----------
+async function doEncrypt() {
+  const text = $("input").value;
+  if (!text.trim()) return say("Введіть текст для шифрування.", "err");
+  if (remaining() <= 0) {
+    return say(`Ліміт (${dailyLimit()}) вичерпано. Введіть промокод або чекайте до завтра.`, "err");
+  }
+  try {
+    const cipher = await encryptText(text, $("pw").value);
+    vault.push({ time: nowStr(), cipher });
+    saveVault();
+    registerEncrypt();
+    $("output").value = cipher;
+    const copied = await copyText(cipher);
+    await refreshList();
+    const tail = copied ? "і скопійовано" : "(копіювання заблоковано браузером)";
+    say(`Зашифровано ${tail}. Залишилось сьогодні: ${remaining()}.`, copied ? "ok" : "err");
+  } catch (e) {
+    say("Помилка шифрування: " + e.message, "err");
+  }
+}
+
+async function doDecrypt() {
+  const cipher = $("input").value.trim();
+  if (!cipher) return say("Вставте шифр у верхнє поле.", "err");
+  try {
+    $("output").value = await decryptText(cipher, $("pw").value);
+    say("Розшифровано.", "ok");
+  } catch (e) {
+    say(errorText(e), "err");
+  }
+}
+
+async function histClip() {
+  const idx = selectedIndex();
+  if (idx === null) return;
+  try {
+    const text = await decryptText(vault[idx].cipher, $("pw").value);
+    await copyText(text);
+    say("Розшифровано і скопійовано.", "ok");
+  } catch (e) {
+    say(errorText(e), "err");
+  }
+}
+
+async function histShow() {
+  const idx = selectedIndex();
+  if (idx === null) return;
+  try {
+    $("output").value = await decryptText(vault[idx].cipher, $("pw").value);
+    say("Показано в результаті.", "ok");
+  } catch (e) {
+    say(errorText(e), "err");
+  }
+}
+
+async function histCipher() {
+  const idx = selectedIndex();
+  if (idx === null) return;
+  await copyText(vault[idx].cipher);
+  say("Шифр скопійовано.", "ok");
+}
+
+async function histDelete() {
+  const idx = selectedIndex();
+  if (idx === null) return;
+  if (!confirm("Видалити вибраний запис?")) return;
+  vault.splice(idx, 1);
+  saveVault();
+  await refreshList();
+  say("Запис видалено.");
+}
+
+async function histClear() {
+  if (!vault.length) return say("Історія порожня.");
+  if (!confirm("Видалити всю історію? Цю дію не скасувати.")) return;
+  vault = [];
+  saveVault();
+  previewCache.clear();
+  await refreshList();
+  say("Історію очищено.");
+}
+
+function promo() {
+  const code = prompt("Введіть промокод:");
+  if (code === null) return;
+  if (activatePromo(code)) {
+    say(`Промокод активовано. Ліміт: ${dailyLimit()} шифрів на день.`, "ok");
+  } else {
+    say("Невірний промокод.", "err");
+  }
+}
+
+// ---------- Прив'язка подій ----------
+$("btnEnc").onclick = doEncrypt;
+$("btnDec").onclick = doDecrypt;
+$("btnPromo").onclick = promo;
+$("btnClear").onclick = () => { $("input").value = ""; };
+$("btnPaste").onclick = async () => {
+  try {
+    $("input").value += await navigator.clipboard.readText();
+    say("Вставлено з буфера.", "ok");
+  } catch {
+    say("Немає доступу до буфера. Вставте текст вручну (Ctrl+V).", "err");
+  }
+};
+$("btnCopy").onclick = async () => {
+  if (!$("output").value) return say("Немає результату.", "err");
+  await copyText($("output").value);
+  say("Скопійовано.", "ok");
+};
+$("btnHistClip").onclick = histClip;
+$("btnHistShow").onclick = histShow;
+$("btnHistCipher").onclick = histCipher;
+$("btnHistDel").onclick = histDelete;
+$("btnHistClear").onclick = histClear;
+$("search").oninput = refreshList;
+
+document.addEventListener("keydown", e => {
+  if (e.ctrlKey && e.key === "Enter") doEncrypt();
+  if (e.ctrlKey && e.key.toLowerCase() === "d") { e.preventDefault(); doDecrypt(); }
+});
+
+refreshList();
+
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("sw.js").catch(() => {});
+}
+</script>
+</body>
+</html>
